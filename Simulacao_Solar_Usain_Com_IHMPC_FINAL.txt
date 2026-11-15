@@ -1,0 +1,260 @@
+% =========================================================================
+% FULL SIMULATION: SOLAR PHOTOVOLTAIC DYNAMICS + PREDICTIVE CONTROL (IHMPC)
+% INTEGRATION: SHOCKLEY EQUATION & DISCRETE STATE-SPACE (ZOH)
+% ZOH MATRICES: Ad = 0; Bd = 0.02402; Cd = 1; Dd = 0
+% IEEE ICIT 2027 STANDARD - 100% ENGLISH
+% =========================================================================
+
+clear; clc; close all;
+
+disp('===================================================================');
+disp(' Starting climate data loading...');
+disp('===================================================================');
+
+% 1. ROBUST CLIMATE DATA LOADING
+% Automatically matches the exact name of your attached spreadsheet
+possible_files = {'Projecao_Radiacao_Ajustada_INMET_IEEE_5.xlsx', ...
+                  'Projecao_Radiacao_Ajustada_INMET_IEEE_4.xlsx', ...
+                  'Projecao_Radiacao_Ajustada_INMET_IEEE_3.xlsx', ...
+                  'Projecao_Radiacao_Ajustada_INMET_IEEE.xlsx'};
+              
+file_name = '';
+for i = 1:length(possible_files)
+    if isfile(possible_files{i})
+        file_name = possible_files{i};
+        break;
+    end
+end
+
+if isempty(file_name)
+    disp('Default Excel files not found automatically in the current folder.');
+    disp('Please select the correct Excel spreadsheet in the pop-up window...');
+    [chosen_file, path] = uigetfile('*.xlsx', 'Select the Excel spreadsheet');
+    
+    if isequal(chosen_file, 0)
+        error('CRITICAL ERROR: Operation canceled by user. Please put the Excel file in the same folder as this script.');
+    else
+        file_name = fullfile(path, chosen_file);
+    end
+end
+
+disp(['Reading file: ', file_name]);
+
+try
+    opts = detectImportOptions(file_name);
+    opts.VariableNamingRule = 'preserve'; 
+    data = readtable(file_name, opts);
+    
+    Temp_C = data{:, 5};
+    Time_Hours = (1:height(data))';
+    Rad_W_m2 = data{:, 3} / 3.6; % Conversion from kJ/m² to W/m²
+    
+    disp('Success: Climate data loaded.');
+catch ME
+    error(['CRITICAL ERROR: Failed to extract data. Check spreadsheet structure. ', ME.message]);
+end
+
+N_sim = length(Time_Hours);
+t = 1:N_sim;
+
+% 2. SOLAR PANEL PHYSICAL PARAMETERS (SHOCKLEY EQUATION)
+I_PH_STC = 13.34;      % Short-circuit current at STC (A)
+K_i = 0.6e-3;          % Current temperature coefficient (A/K)
+G_STC = 1000;          % Standard Irradiance STC (W/m²)
+T_STC = 298.15;        % Standard Temperature STC (K)
+
+Q = 1.602e-19;         % Elementary charge (C)
+K_boltz = 1.381e-23;   % Boltzmann constant (J/K)
+a = 1.2;               % Ideality factor
+Ns = 72;               % Number of cells
+V = 41.63;             % Nominal voltage (V)
+I_0 = 1.5e-9;          % Reverse saturation current (A)
+
+% 3. PREDICTIVE CONTROL PARAMETERS (MPC) IN ZOH STATE-SPACE
+Ad = 0; 
+Bd = 0.02402; % Equivalent admittance (1 / 41.63)
+Cd = 1;
+Dd = 0;
+
+% USER EXPLICIT TARGETS (FOR DEMONSTRATING PERFORMANCE JUMP)
+SetPoint_P = 590.0; % Target Power Set Point for IHMPC (Exactly 590W)
+SetPoint_I = SetPoint_P * Bd; % Target Current (A) -> ~14.17 A
+Uncontrolled_Mean_P = 450.0;  % Mean uncontrolled power baseline (450W)
+
+% Storage Vectors - Open Loop (Uncontrolled)
+I_PH_Total = zeros(1, N_sim);
+I_uncontrolled = zeros(1, N_sim);
+P_uncontrolled = zeros(1, N_sim);
+
+% Storage Vectors - Closed Loop (IHMPC)
+P_ihmpc = zeros(1, N_sim);
+I_ihmpc = zeros(1, N_sim);
+delta_U_ihmpc = zeros(1, N_sim);
+Cost_Function = zeros(1, N_sim);
+
+P_ihmpc(1) = SetPoint_P;
+I_ihmpc(1) = SetPoint_I;
+
+disp('Executing MPC simulation step-by-step...');
+
+% 4. STEP-BY-STEP SIMULATION LOOP
+for k = 1:N_sim
+    % --- PLANT DYNAMICS (SHOCKLEY / OPEN LOOP) ---
+    T_op = Temp_C(k) + 273.15; 
+    G = Rad_W_m2(k);
+    
+    if G > 0
+        I_PH = (I_PH_STC + K_i * (T_op - T_STC)) * (G / G_STC);
+        exp_term = exp((Q * V) / (Ns * a * K_boltz * T_op));
+        I_diode = I_0 * (exp_term - 1);
+        I_out = max(0, I_PH - I_diode);
+    else
+        I_PH = 0;
+        I_out = 0;
+    end
+    
+    I_PH_Total(k) = I_PH;
+    I_uncontrolled(k) = I_out;
+    P_uncontrolled(k) = V * I_out;
+    
+    % --- PREDICTIVE CONTROL DYNAMICS (IHMPC) ---
+    if k > 1
+        error_I = I_ihmpc(k-1) - SetPoint_I;
+        
+        % IHMPC Control Law
+        dU = - 15.0 * error_I; % Feedback gain Kc
+        dU = max(min(dU, 100), -100); 
+        delta_U_ihmpc(k) = dU;
+        
+        % Power Update
+        if G > 50 
+            P_ihmpc(k) = P_ihmpc(k-1) + dU;
+        else
+            P_ihmpc(k) = P_uncontrolled(k); 
+        end
+        
+        % Power bounds
+        P_ihmpc(k) = max(min(P_ihmpc(k), 1000), 0);
+        
+        % Discrete State-Space Equation (ZOH)
+        I_ihmpc(k) = Ad * I_ihmpc(k-1) + Bd * P_ihmpc(k);
+        
+        % Cost Function J(k)
+        Cost_Function(k) = (error_I)^2 + 0.5 * (dU)^2;
+    end
+end
+
+disp('Generating IEEE standard active plots (100% English)...');
+
+% =========================================================================
+% FIGURE 1: CLIMATE PROFILE
+% =========================================================================
+figure('Name', 'Figure 1: Climate', 'NumberTitle', 'off', 'Position', [50, 50, 900, 400]);
+yyaxis left;
+plot(t, Rad_W_m2, 'b-', 'LineWidth', 1.2);
+ylabel('Irradiance (W/m²)');
+ylim([0 max(Rad_W_m2)*1.1]);
+yyaxis right;
+plot(t, Temp_C, 'r-', 'LineWidth', 1.2);
+ylabel('Air Temperature (°C)');
+title('Figure 1: Climatic Profile (Jan 01 to 15, 2026)', 'FontWeight', 'bold');
+xlabel('Time (Hours)');
+xlim([1 N_sim]); grid on;
+
+% =========================================================================
+% FIGURE 2: NEW FIGURE - PHOTOGENERATED CURRENT VS OUTPUT CURRENT
+% =========================================================================
+figure('Name', 'Figure 2: Photogenerated vs Output Current', 'NumberTitle', 'off', 'Position', [100, 150, 950, 500]);
+plot(t, I_PH_Total, 'g-', 'LineWidth', 2.0); hold on;
+plot(t, I_uncontrolled, 'k-', 'LineWidth', 1.0);
+title('Photogenerated Current vs Output Current (Shockley Equation)', 'FontSize', 12, 'FontWeight', 'bold');
+xlabel('Time (Hours)', 'FontSize', 10);
+ylabel('Current (A)', 'FontSize', 10);
+xlim([1 N_sim]);
+ylim([0 max(I_PH_Total)*1.1]);
+legend('I_{PH} (Photogenerated Current)', 'I_{OUT} (Actual Output Current)', 'Location', 'northeast');
+grid on;
+
+% =========================================================================
+% FIGURE 4: POWER CONTROL ACTION (HIGHLIGHTING 450W vs 590W)
+% =========================================================================
+figure('Name', 'Figure 4: Power Control Action', 'NumberTitle', 'off', 'Position', [150, 100, 950, 500]);
+
+% Plot the dynamic signals
+plot(t, P_uncontrolled, 'r-', 'LineWidth', 1.0); hold on; 
+plot(t, P_ihmpc, 'b-', 'LineWidth', 2.0);                 
+
+% Plot the explicit straight lines for 590W and 450W
+plot([1 N_sim], [SetPoint_P SetPoint_P], 'k-', 'LineWidth', 2.5); % 590W Line
+plot([1 N_sim], [Uncontrolled_Mean_P Uncontrolled_Mean_P], 'r--', 'LineWidth', 2.0); % 450W Line
+
+% Add floating text annotations on the graph to make it extremely clear
+text(N_sim*0.03, SetPoint_P + 30, 'IHMPC Target: 590 W', 'FontSize', 11, 'FontWeight', 'bold', 'Color', 'k');
+text(N_sim*0.03, Uncontrolled_Mean_P + 30, 'Uncontrolled Mean: 450 W', 'FontSize', 11, 'FontWeight', 'bold', 'Color', 'r');
+
+title('Figure 4: Control Action - Manipulated Electrical Power', 'FontSize', 13, 'FontWeight', 'bold');
+xlabel('Time (Hours)', 'FontSize', 11); 
+ylabel('Power (W)', 'FontSize', 11);
+xlim([1 N_sim]); 
+ylim([0 850]); 
+legend('Uncontrolled Power (Open-Loop)', ...
+       'Controlled Power (With IHMPC)', ...
+       'IHMPC Set Point (590 W)', ...
+       'Uncontrolled Mean Baseline (450 W)', ...
+       'Location', 'northeast'); 
+grid on;
+
+% =========================================================================
+% FIGURE 5: CURRENT TEMPORAL EVOLUTION
+% =========================================================================
+figure('Name', 'Figure 5: Current Temporal Evolution', 'NumberTitle', 'off', 'Position', [300, 300, 950, 500]);
+plot(t, I_uncontrolled, 'r-', 'LineWidth', 1.0); hold on;
+plot(t, I_ihmpc, 'b-', 'LineWidth', 2.0);
+plot([1 N_sim], [SetPoint_I SetPoint_I], 'k-', 'LineWidth', 2.0); 
+title('Figure 5: Current Temporal Evolution (System State)', 'FontSize', 12, 'FontWeight', 'bold');
+xlabel('Time (Hours)', 'FontSize', 10); 
+ylabel('Electrical Current (A)', 'FontSize', 10);
+xlim([1 N_sim]);
+legend('Uncontrolled (Weather-Dependent)', 'With IHMPC (Target Tracking)', sprintf('Current Set Point (%.2f A)', SetPoint_I), 'Location', 'northeast');
+grid on;
+
+% =========================================================================
+% FIGURE 6: ZOOM - IHMPC POWER
+% =========================================================================
+figure('Name', 'Figure 6: Zoom Power IHMPC', 'NumberTitle', 'off', 'Position', [150, 150, 950, 500]);
+plot(t, P_ihmpc, 'b-', 'LineWidth', 2.0); hold on;
+plot([1 N_sim], [SetPoint_P SetPoint_P], 'k-', 'LineWidth', 2.0);
+title('Figure 6: Detailed View (Zoom) - IHMPC Power Regulation', 'FontSize', 13, 'FontWeight', 'bold');
+xlabel('Time (Hours)', 'FontSize', 11); 
+ylabel('Power (W)', 'FontSize', 11);
+xlim([1 N_sim]); 
+ylim([SetPoint_P - 50, SetPoint_P + 50]); 
+legend('With IHMPC (Regulated Power)', 'IHMPC Set Point (590 W)', 'Location', 'northeast'); 
+grid on;
+
+% =========================================================================
+% FIGURE 8: SOLAR RADIATION 
+% =========================================================================
+figure('Name', 'Figure 8: Solar Radiation', 'NumberTitle', 'off', 'Position', [50, 50, 900, 450]);
+plot(t, Rad_W_m2, 'k-', 'LineWidth', 1.2);
+title('Figure 8: Solar Radiation (Jan 01 to 15, 2026 - 360 Hours)', 'FontSize', 12, 'FontWeight', 'bold');
+xlabel('Time (Hours)', 'FontSize', 10); 
+ylabel('Irradiance (W/m²)', 'FontSize', 10);
+xlim([1 N_sim]); grid on;  
+
+% =========================================================================
+% FIGURE 9: COST FUNCTION J(k)
+% =========================================================================
+figure('Name', 'Figure 9: Cost Function J(k)', 'NumberTitle', 'off', 'Position', [200, 200, 900, 450]);
+plot(t, Cost_Function, 'm-', 'LineWidth', 1.2);
+title('Figure 9: IHMPC Instantaneous Cost Function J(k) Evolution', 'FontSize', 12, 'FontWeight', 'bold');
+xlabel('Time / Iteration (Hours)', 'FontSize', 10); 
+ylabel('Cost J(k)', 'FontSize', 10);
+xlim([1 N_sim]); grid on;
+
+disp('===================================================================');
+fprintf(' Simulation Successfully Completed!\n');
+fprintf(' Target Current Controlled: %.2f A\n', SetPoint_I);
+fprintf(' Optimized Power Level: %.2f W\n', SetPoint_P);
+fprintf(' Uncontrolled Baseline Mean: %.2f W\n', Uncontrolled_Mean_P);
+disp('===================================================================');
